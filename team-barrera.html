@@ -251,13 +251,15 @@ function fmtMoney(n){ return '$' + Number(n||0).toLocaleString('es-MX'); }
 
 function emptyForm(){
   return { id:null, nombre:'', modalidad:'Presencial', grupo:'Avanzados', ciudad:'',
-    mensualidad:'', diaCobro:'1', meta:'', estado:'Activo', rotationDay:null };
+    mensualidad:'', diaCobro:'1', meta:'', estado:'Activo', rotationDay:null,
+    eventoId:'', newEventoNombre:'' };
 }
 
 // ---------- realtime data hook ----------
 function useTeamData(){
   const [db,setDb] = useState(undefined); // undefined=checking, null=unavailable
   const [athletes,setAthletes] = useState(null); // null=loading
+  const [events,setEvents] = useState([]);
   const [flash,setFlash] = useState({});
   const [period,setPeriod] = useState(currentPeriodKey());
   const [paidIds,setPaidIds] = useState(new Set());
@@ -304,9 +306,29 @@ function useTeamData(){
     return unsub;
   },[db,period]);
 
+  useEffect(()=>{
+    if(!db) return;
+    const unsub = db.collection('events').onSnapshot(snap=>{
+      const list = snap.docs.map(d=>({ id:d.id, ...d.data() }));
+      list.sort((a,b)=>(a.nombre||'').localeCompare(b.nombre||''));
+      setEvents(list);
+    }, err=>{ console.warn('events onSnapshot', err); });
+    return unsub;
+  },[db]);
+
+  // Any online athlete without a rotation day gets one at random — on
+  // creation, and also if an edit turns someone online (or otherwise
+  // clears their day) without picking one.
+  function withAutoRotation(body){
+    if(body.modalidad==='Online' && !body.rotationDay){
+      return { ...body, rotationDay: WEEKDAYS[Math.floor(Math.random()*WEEKDAYS.length)] };
+    }
+    return body;
+  }
+
   function upsertAthlete(form){
     if(!db) return;
-    const body = {
+    const body = withAutoRotation({
       nombre: form.nombre.trim(),
       modalidad: form.modalidad,
       grupo: form.modalidad==='Presencial' ? form.grupo : '',
@@ -316,17 +338,12 @@ function useTeamData(){
       meta: (form.meta||'').trim(),
       estado: form.estado || 'Activo',
       rotationDay: form.rotationDay || null,
+      eventoId: form.modalidad==='Online' ? (form.eventoId || null) : null,
       fechaAlta: form.fechaAlta || todayISO(),
-    };
+    });
     const col = db.collection('athletes');
-    if(form.id){
-      col.doc(form.id).set(body).catch(e=>console.warn('set athlete',e));
-    }else{
-      if(body.modalidad==='Online' && !body.rotationDay){
-        body.rotationDay = WEEKDAYS[Math.floor(Math.random()*WEEKDAYS.length)];
-      }
-      col.add(body).catch(e=>console.warn('add athlete',e));
-    }
+    if(form.id) col.doc(form.id).set(body).catch(e=>console.warn('set athlete',e));
+    else col.add(body).catch(e=>console.warn('add athlete',e));
   }
   function setEstado(id,estado){
     if(!db) return;
@@ -342,8 +359,30 @@ function useTeamData(){
     if(paidIds.has(athleteId)) ref.delete().catch(e=>console.warn('unpay',e));
     else ref.set({paid:true, paidAt:new Date().toISOString()}).catch(e=>console.warn('pay',e));
   }
+  async function createEvent(nombre){
+    if(!db) return null;
+    const clean = (nombre||'').trim();
+    if(!clean) return null;
+    const ref = await db.collection('events').add({ nombre:clean, createdAt:new Date().toISOString() });
+    return ref.id;
+  }
+  function assignAthleteEvent(athleteId, eventoId){
+    if(!db) return;
+    db.collection('athletes').doc(athleteId).update({eventoId: eventoId||null}).catch(e=>console.warn('assignEvent',e));
+  }
+  async function deleteEvent(eventoId, athleteIdsToUnassign){
+    if(!db) return;
+    try{
+      for(const aid of athleteIdsToUnassign){
+        await db.collection('athletes').doc(aid).update({eventoId:null});
+      }
+      await db.collection('events').doc(eventoId).delete();
+    }catch(e){ console.warn('deleteEvent',e); }
+  }
 
-  return { db, athletes, flash, period, setPeriod, paidIds, upsertAthlete, setEstado, assignRotationDay, togglePaid };
+  return { db, athletes, events, flash, period, setPeriod, paidIds,
+    upsertAthlete, setEstado, assignRotationDay, togglePaid,
+    createEvent, assignAthleteEvent, deleteEvent };
 }
 
 function App(){
@@ -390,16 +429,19 @@ function App(){
   const pendingThisPeriod = active.filter(a=>!data.paidIds.has(a.id));
   const collected = paidThisPeriod.reduce((s,a)=>s+(Number(a.mensualidad)||0),0);
   const pendingAmt = pendingThisPeriod.reduce((s,a)=>s+(Number(a.mensualidad)||0),0);
+  const eventsById = {};
+  data.events.forEach(ev=>{ eventsById[ev.id] = ev; });
 
   return h('div',{id:'app'},[
     Sidebar({tab,setTab,synced:true}),
     h('main',{key:'main'},[
       tab==='dashboard' && Dashboard({active,activePresencial,activeOnline,totalMensual,promedio,collected,pendingAmt,pendingThisPeriod,period:data.period,flash:data.flash}),
-      tab==='atletas' && Atletas({visibleAthletes,search,setSearch,filterMod,setFilterMod,filterEstado,setFilterEstado,setModal,setEstado:data.setEstado,flash:data.flash}),
+      tab==='atletas' && Atletas({visibleAthletes,search,setSearch,filterMod,setFilterMod,filterEstado,setFilterEstado,setModal,setEstado:data.setEstado,flash:data.flash,eventsById}),
       tab==='pagos' && Pagos({active,period:data.period,setPeriod:data.setPeriod,paidIds:data.paidIds,togglePaid:data.togglePaid,collected,pendingAmt}),
-      tab==='rotacion' && Rotacion({activeOnline,assignRotationDay:data.assignRotationDay}),
+      tab==='rotacion' && Rotacion({activeOnline,assignRotationDay:data.assignRotationDay,eventsById}),
+      tab==='eventos' && h(Eventos,{key:'ev',events:data.events,activeOnline,assignAthleteEvent:data.assignAthleteEvent,createEvent:data.createEvent,deleteEvent:data.deleteEvent}),
     ]),
-    modal && h(Modal,{key:'modal',modal,setModal,upsertAthlete:data.upsertAthlete}),
+    modal && h(Modal,{key:'modal',modal,setModal,upsertAthlete:data.upsertAthlete,events:data.events,createEvent:data.createEvent}),
   ]);
 }
 
@@ -409,6 +451,7 @@ function Sidebar({tab,setTab}){
     {key:'atletas',label:'Atletas',n:'02'},
     {key:'pagos',label:'Pagos',n:'03'},
     {key:'rotacion',label:'Rotación',n:'04'},
+    {key:'eventos',label:'Eventos',n:'05'},
   ];
   return h('div',{className:'sidebar',key:'sidebar'},[
     h('div',{className:'brand',key:'b'},[
@@ -468,7 +511,7 @@ function Dashboard({active,activePresencial,activeOnline,totalMensual,promedio,c
   ]);
 }
 
-function Atletas({visibleAthletes,search,setSearch,filterMod,setFilterMod,filterEstado,setFilterEstado,setModal,setEstado,flash}){
+function Atletas({visibleAthletes,search,setSearch,filterMod,setFilterMod,filterEstado,setFilterEstado,setModal,setEstado,flash,eventsById}){
   const presencial = visibleAthletes.filter(a=>a.modalidad==='Presencial');
   const online = visibleAthletes.filter(a=>a.modalidad==='Online');
   return h(React.Fragment,{key:'atl'},[
@@ -488,12 +531,13 @@ function Atletas({visibleAthletes,search,setSearch,filterMod,setFilterMod,filter
           ['Activo','Inactivo','Todos'].map(o=>h('option',{key:o,value:o},o))),
       ]),
     ),
-    AthleteTable('Presencial', presencial, setModal, setEstado, flash),
-    AthleteTable('Online', online, setModal, setEstado, flash),
+    AthleteTable('Presencial', presencial, setModal, setEstado, flash, eventsById),
+    AthleteTable('Online', online, setModal, setEstado, flash, eventsById),
   ]);
 }
 
-function AthleteTable(title, list, setModal, setEstado, flash){
+function AthleteTable(title, list, setModal, setEstado, flash, eventsById){
+  const isOnline = title==='Online';
   return h('div',{className:'panel',key:title},[
     h('div',{className:'panel-head',key:'h'},[
       h('h2',{key:'t'},title),
@@ -502,13 +546,14 @@ function AthleteTable(title, list, setModal, setEstado, flash){
     list.length===0
       ? h('div',{className:'empty',key:'e'},[h('h3',{key:'h'},'Sin resultados'),'Ajusta la búsqueda o da de alta a alguien nuevo.'])
       : h('div',{className:'panel-scroll',key:'sc'}, h('table',{},[
-          h('thead',{key:'h'},h('tr',{},['Nombre',(title==='Presencial'?'Grupo':'Ciudad'),'Mensualidad','Día','Meta','Estado',''].map(x=>h('th',{key:x},x)))),
+          h('thead',{key:'h'},h('tr',{},['Nombre',(title==='Presencial'?'Grupo':'Ciudad'),'Mensualidad','Día',(isOnline?'Evento':'Meta'),'Estado',''].map(x=>h('th',{key:x},x)))),
           h('tbody',{key:'b'},list.map(a=>h('tr',{key:a.id,className:flash[a.id]?'flash':''},[
             h('td',{key:'n'},a.nombre),
             h('td',{key:'g'},title==='Presencial'?a.grupo:a.ciudad),
             h('td',{key:'$'},fmtMoney(a.mensualidad)),
             h('td',{key:'d'},a.diaCobro),
-            h('td',{key:'me',style:{color:'var(--muted)',fontSize:'13px'}},a.meta||'—'),
+            h('td',{key:'me',style:{color:'var(--muted)',fontSize:'13px'}},
+              isOnline ? ((eventsById[a.eventoId]&&eventsById[a.eventoId].nombre) || a.meta || '—') : (a.meta||'—')),
             h('td',{key:'es'},h('span',{className:'tag '+(a.estado==='Activo'?'tag-olive':'tag-off')},a.estado)),
             h('td',{key:'act',style:{whiteSpace:'nowrap'}},[
               h('button',{className:'btn-small btn-ghost',key:'edit',style:{marginRight:6},onClick:()=>setModal({mode:'edit',form:{...a}})},'Editar'),
@@ -563,8 +608,11 @@ function Pagos({active,period,setPeriod,paidIds,togglePaid,collected,pendingAmt}
   ]);
 }
 
-function Rotacion({activeOnline,assignRotationDay}){
+function Rotacion({activeOnline,assignRotationDay,eventsById}){
   const unassigned = activeOnline.filter(a=>!a.rotationDay);
+  function goalLabel(a){
+    return (eventsById[a.eventoId] && eventsById[a.eventoId].nombre) || a.meta || null;
+  }
   return h(React.Fragment,{key:'rot'},[
     h('div',{className:'pagehead',key:'h'},
       h('div',{key:'l'},[
@@ -578,7 +626,7 @@ function Rotacion({activeOnline,assignRotationDay}){
       return h('div',{className:'day-col',key:day},[
         h('div',{className:'day-col-head',key:'h'},[day,h('span',{key:'c'},list.length)]),
         ...list.map(a=>h('div',{className:'day-athlete',key:a.id},[
-          h('div',{key:'i'},[a.nombre,h('div',{className:'goal',key:'g'},a.meta||'Sin meta')]),
+          h('div',{key:'i'},[a.nombre,h('div',{className:'goal',key:'g'},goalLabel(a)||'Sin meta')]),
           h('button',{key:'x',onClick:()=>assignRotationDay(a.id,null),title:'Quitar de este día','aria-label':'Quitar de este día'},'×'),
         ])),
       ]);
@@ -586,11 +634,11 @@ function Rotacion({activeOnline,assignRotationDay}){
     unassigned.length>0 && h('div',{className:'panel unassigned',key:'un'},[
       h('div',{className:'panel-head',key:'h'},h('h2',{key:'t'},'Sin asignar ('+unassigned.length+')')),
       h('div',{className:'panel-scroll',key:'sc'}, h('table',{},[
-        h('thead',{key:'h'},h('tr',{},['Atleta','Ciudad','Meta','Asignar a…'].map(x=>h('th',{key:x},x)))),
+        h('thead',{key:'h'},h('tr',{},['Atleta','Ciudad','Evento','Asignar a…'].map(x=>h('th',{key:x},x)))),
         h('tbody',{key:'b'},unassigned.map(a=>h('tr',{key:a.id},[
           h('td',{key:'n'},a.nombre),
           h('td',{key:'c'},a.ciudad),
-          h('td',{key:'g',style:{fontSize:13,color:'var(--muted)'}},a.meta||'—'),
+          h('td',{key:'g',style:{fontSize:13,color:'var(--muted)'}},goalLabel(a)||'—'),
           h('td',{key:'s'},h('select',{
             defaultValue:'',
             onChange:e=>{ if(e.target.value) assignRotationDay(a.id,e.target.value); },
@@ -601,13 +649,115 @@ function Rotacion({activeOnline,assignRotationDay}){
   ]);
 }
 
-function Modal({modal,setModal,upsertAthlete}){
-  const [form,setForm] = useState(modal.form);
-  function set(k,v){ setForm(prev=>({...prev,[k]:v})); }
-  function submit(e){
+function Eventos({events,activeOnline,assignAthleteEvent,createEvent,deleteEvent}){
+  const [expanded,setExpanded] = useState(null);
+  const [newName,setNewName] = useState('');
+  const rosterByEvent = useMemo(()=>{
+    const map = {};
+    activeOnline.forEach(a=>{
+      if(!a.eventoId) return;
+      (map[a.eventoId] = map[a.eventoId] || []).push(a);
+    });
+    Object.values(map).forEach(list=>list.sort((a,b)=>a.nombre.localeCompare(b.nombre)));
+    return map;
+  },[activeOnline]);
+  const sortedEvents = useMemo(()=>{
+    return [...events].sort((a,b)=>{
+      const na = (rosterByEvent[a.id]||[]).length, nb = (rosterByEvent[b.id]||[]).length;
+      if(nb!==na) return nb-na;
+      return a.nombre.localeCompare(b.nombre);
+    });
+  },[events,rosterByEvent]);
+  const sinEvento = activeOnline.filter(a=>!a.eventoId);
+
+  function submitNew(e){
     e.preventDefault();
-    if(!form.nombre.trim()) return;
-    upsertAthlete(form);
+    const name = newName.trim();
+    if(!name) return;
+    createEvent(name);
+    setNewName('');
+  }
+  function removeEvent(ev){
+    const athleteIds = (rosterByEvent[ev.id]||[]).map(a=>a.id);
+    const msg = athleteIds.length
+      ? '¿Eliminar "'+ev.nombre+'"? '+athleteIds.length+' atleta(s) quedarán sin evento asignado.'
+      : '¿Eliminar "'+ev.nombre+'"?';
+    if(window.confirm(msg)) deleteEvent(ev.id, athleteIds);
+  }
+
+  return h(React.Fragment,{key:'ev'},[
+    h('div',{className:'pagehead',key:'h'},
+      h('div',{key:'l'},[
+        h('h1',{key:'t'},'Eventos'),
+        h('p',{key:'p'},'Agrupa a tus atletas online por carrera — arma un evento y ve quién más va'),
+      ]),
+    ),
+    h('div',{className:'panel',key:'new'},
+      h('form',{className:'toolbar',onSubmit:submitNew},[
+        h('input',{className:'search',id:'nuevo-evento',key:'i',placeholder:'Nombre del evento, ej. Maratón CDMX…',value:newName,onChange:e=>setNewName(e.target.value)}),
+        h('button',{className:'btn-primary btn-small',key:'b',type:'submit'},'+ Crear evento'),
+      ]),
+    ),
+    sortedEvents.length===0
+      ? h('div',{className:'panel',key:'empty'}, h('div',{className:'empty'},[h('h3',{key:'h'},'Aún no hay eventos'),'Crea el primero arriba para empezar a agrupar atletas.']))
+      : sortedEvents.map(ev=>{
+          const roster = rosterByEvent[ev.id]||[];
+          const isOpen = expanded===ev.id;
+          return h('div',{className:'panel',key:ev.id},[
+            h('div',{className:'panel-head',key:'h',style:{cursor:'pointer'},onClick:()=>setExpanded(isOpen?null:ev.id)},[
+              h('h2',{key:'t'},[ev.nombre,' ',h('span',{key:'c',className:'tag tag-olive',style:{marginLeft:8,verticalAlign:'middle'}},roster.length+' atleta(s)')]),
+              h('div',{key:'r',style:{display:'flex',gap:8,alignItems:'center'}},[
+                h('button',{className:'btn-danger',key:'del',onClick:e=>{e.stopPropagation();removeEvent(ev);}},'Eliminar'),
+                h('span',{key:'car',style:{color:'var(--muted)',fontSize:14}},isOpen?'▴':'▾'),
+              ]),
+            ]),
+            isOpen && (roster.length===0
+              ? h('div',{className:'empty',key:'e'},'Nadie asignado todavía. Asígnalo desde "Atletas" o abajo, en "Sin evento".')
+              : h('div',{className:'panel-scroll',key:'sc'}, h('table',{},[
+                  h('thead',{key:'h'},h('tr',{},['Atleta','Ciudad','Mensualidad',''].map(x=>h('th',{key:x},x)))),
+                  h('tbody',{key:'b'},roster.map(a=>h('tr',{key:a.id},[
+                    h('td',{key:'n'},a.nombre),
+                    h('td',{key:'c'},a.ciudad),
+                    h('td',{key:'$'},fmtMoney(a.mensualidad)),
+                    h('td',{key:'x'},h('button',{className:'btn-small btn-ghost',onClick:()=>assignAthleteEvent(a.id,null)},'Quitar del evento')),
+                  ]))),
+                ]))),
+          ]);
+        }),
+    sinEvento.length>0 && h('div',{className:'panel unassigned',key:'un'},[
+      h('div',{className:'panel-head',key:'h'},h('h2',{key:'t'},'Sin evento asignado ('+sinEvento.length+')')),
+      h('div',{className:'panel-scroll',key:'sc'}, h('table',{},[
+        h('thead',{key:'h'},h('tr',{},['Atleta','Ciudad','Nota','Asignar a…'].map(x=>h('th',{key:x},x)))),
+        h('tbody',{key:'b'},sinEvento.map(a=>h('tr',{key:a.id},[
+          h('td',{key:'n'},a.nombre),
+          h('td',{key:'c'},a.ciudad),
+          h('td',{key:'m',style:{fontSize:13,color:'var(--muted)'}},a.meta||'—'),
+          h('td',{key:'s'},h('select',{
+            defaultValue:'',
+            onChange:e=>{ if(e.target.value) assignAthleteEvent(a.id,e.target.value); },
+          },[h('option',{key:'',value:''},'Elegir evento…'),...events.map(ev=>h('option',{key:ev.id,value:ev.id},ev.nombre))])),
+        ]))),
+      ])),
+    ]),
+  ]);
+}
+
+function Modal({modal,setModal,upsertAthlete,events,createEvent}){
+  const [form,setForm] = useState({...emptyForm(), ...modal.form});
+  const [saving,setSaving] = useState(false);
+  function set(k,v){ setForm(prev=>({...prev,[k]:v})); }
+  async function submit(e){
+    e.preventDefault();
+    if(!form.nombre.trim() || saving) return;
+    let eventoId = form.eventoId;
+    if(form.modalidad==='Online' && eventoId==='__new__'){
+      const name = (form.newEventoNombre||'').trim();
+      if(!name){ return; }
+      setSaving(true);
+      eventoId = await createEvent(name);
+      setSaving(false);
+    }
+    upsertAthlete({...form, eventoId});
     setModal(null);
   }
   return h('div',{className:'modal-bg',onClick:e=>{ if(e.target===e.currentTarget) setModal(null); }},
@@ -627,10 +777,20 @@ function Modal({modal,setModal,upsertAthlete}){
           Field('mensualidad','Mensualidad (MXN)', h('input',{id:'mensualidad',type:'number',required:true,value:form.mensualidad,onChange:e=>set('mensualidad',e.target.value)})),
           Field('diaCobro','Día de cobro', h('input',{id:'diaCobro',type:'number',min:1,max:31,required:true,value:form.diaCobro,onChange:e=>set('diaCobro',e.target.value)})),
         ]),
-        Field('meta','Meta / carrera (opcional)', h('input',{id:'meta',value:form.meta,onChange:e=>set('meta',e.target.value)})),
+        form.modalidad==='Presencial'
+          ? Field('meta','Meta / carrera (opcional)', h('input',{id:'meta',value:form.meta,onChange:e=>set('meta',e.target.value)}))
+          : h(React.Fragment,{key:'ev-fields'},[
+              Field('evento','Evento', h('select',{id:'evento',value:form.eventoId||'',onChange:e=>set('eventoId',e.target.value)},[
+                h('option',{key:'',value:''},'Sin evento asignado'),
+                ...events.map(ev=>h('option',{key:ev.id,value:ev.id},ev.nombre)),
+                h('option',{key:'__new__',value:'__new__'},'+ Crear nuevo evento…'),
+              ])),
+              form.eventoId==='__new__' && Field('newEvento','Nombre del nuevo evento', h('input',{id:'newEvento',autoFocus:true,value:form.newEventoNombre||'',onChange:e=>set('newEventoNombre',e.target.value)})),
+              Field('meta','Nota (opcional)', h('input',{id:'meta',placeholder:'Ej. mejorar tiempos, cortesía…',value:form.meta,onChange:e=>set('meta',e.target.value)})),
+            ]),
         h('div',{className:'modal-actions',key:'act'},[
           h('button',{type:'button',className:'btn-ghost',key:'c',onClick:()=>setModal(null)},'Cancelar'),
-          h('button',{type:'submit',className:'btn-primary',key:'s'},modal.mode==='new'?'Dar de alta':'Guardar cambios'),
+          h('button',{type:'submit',className:'btn-primary',key:'s',disabled:saving},saving?'Guardando…':(modal.mode==='new'?'Dar de alta':'Guardar cambios')),
         ]),
       ]),
     ]),
