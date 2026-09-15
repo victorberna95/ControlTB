@@ -207,7 +207,7 @@
     }
     .navitem.active{border-left:none;border-bottom-color:var(--sidebar-accent);}
     .navitem .lane-num{display:none;}
-    .sync{display:none;}
+    .sync,.sidebar-lock{display:none;}
 
     main{padding:20px 16px 40px;max-width:100%;}
     .pagehead{flex-direction:column;align-items:flex-start;gap:10px;}
@@ -260,6 +260,7 @@ function useTeamData(){
   const [db,setDb] = useState(undefined); // undefined=checking, null=unavailable
   const [athletes,setAthletes] = useState(null); // null=loading
   const [events,setEvents] = useState([]);
+  const [accessCode,setAccessCode] = useState(undefined); // undefined=loading, null=none set yet, string=set
   const [flash,setFlash] = useState({});
   const [period,setPeriod] = useState(currentPeriodKey());
   const [paidIds,setPaidIds] = useState(new Set());
@@ -315,6 +316,20 @@ function useTeamData(){
     }, err=>{ console.warn('events onSnapshot', err); });
     return unsub;
   },[db]);
+
+  useEffect(()=>{
+    if(!db) return;
+    const unsub = db.doc('settings/access').onSnapshot(snap=>{
+      const data = snap.exists ? snap.data() : null;
+      setAccessCode(data && data.code ? data.code : null);
+    }, err=>{ console.warn('access onSnapshot', err); setAccessCode(null); });
+    return unsub;
+  },[db]);
+
+  function setTeamAccessCode(code){
+    if(!db) return;
+    db.doc('settings/access').set({ code, updatedAt:new Date().toISOString() }).catch(e=>console.warn('setAccessCode',e));
+  }
 
   // Any online athlete without a rotation day gets one at random — on
   // creation, and also if an edit turns someone online (or otherwise
@@ -380,9 +395,50 @@ function useTeamData(){
     }catch(e){ console.warn('deleteEvent',e); }
   }
 
-  return { db, athletes, events, flash, period, setPeriod, paidIds,
+  return { db, athletes, events, accessCode, setTeamAccessCode, flash, period, setPeriod, paidIds,
     upsertAthlete, setEstado, assignRotationDay, togglePaid,
     createEvent, assignAthleteEvent, deleteEvent };
+}
+
+function Lock({accessCode,setTeamAccessCode,onUnlock}){
+  const [input,setInput] = useState('');
+  const [error,setError] = useState('');
+  const creating = accessCode === null;
+
+  function submit(e){
+    e.preventDefault();
+    const clean = input.trim();
+    if(creating){
+      if(clean.length<4){ setError('Usa al menos 4 caracteres.'); return; }
+      setTeamAccessCode(clean);
+      onUnlock();
+    }else{
+      if(clean===accessCode){ onUnlock(); }
+      else{ setError('Código incorrecto.'); setInput(''); }
+    }
+  }
+
+  return h('div',{style:{minHeight:'100%',display:'flex',alignItems:'center',justifyContent:'center',
+    background:'var(--sidebar-bg)',flexDirection:'column',gap:20,padding:'24px',textAlign:'center'}},[
+    h('div',{key:'brand',style:{color:'var(--sidebar-text)'}},[
+      h('div',{className:'brand-name',key:'n',style:{fontSize:26}},'Team Barrera'),
+      h('div',{key:'s',style:{fontSize:12,color:'var(--sidebar-text-dim)',marginTop:4}},'Panel de control'),
+    ]),
+    h('form',{key:'form',onSubmit:submit,style:{background:'var(--surface)',padding:26,width:300,maxWidth:'88vw',textAlign:'left'}},[
+      h('h2',{key:'h',style:{marginTop:0,fontSize:19}}, creating ? 'Crea tu código de acceso' : 'Ingresa tu código de acceso'),
+      h('p',{key:'p',style:{fontSize:13,color:'var(--muted)',marginTop:-6}},
+        creating
+          ? 'Es el mismo para todos los que abran este panel. Compártelo solo con quien deba usarlo.'
+          : 'Pídeselo a quien administra Team Barrera si no lo tienes.'),
+      h('div',{className:'field',key:'f'},[
+        h('label',{key:'l',htmlFor:'codigo-acceso'},'Código'),
+        h('input',{id:'codigo-acceso',type:'password',autoFocus:true,value:input,
+          onChange:e=>{ setInput(e.target.value); setError(''); }}),
+      ]),
+      error && h('div',{key:'err',style:{color:'var(--brick)',fontSize:13,marginBottom:10}},error),
+      h('button',{className:'btn-primary',type:'submit',key:'s',style:{width:'100%'}}, creating ? 'Guardar y entrar' : 'Entrar'),
+    ]),
+  ]);
 }
 
 function App(){
@@ -392,6 +448,17 @@ function App(){
   const [search,setSearch] = useState('');
   const [filterMod,setFilterMod] = useState('Todos');
   const [filterEstado,setFilterEstado] = useState('Activo');
+  const [unlocked,setUnlocked] = useState(()=>{
+    try{ return localStorage.getItem('tb-unlocked')==='1'; }catch(e){ return false; }
+  });
+  function handleUnlock(){
+    try{ localStorage.setItem('tb-unlocked','1'); }catch(e){}
+    setUnlocked(true);
+  }
+  function handleLock(){
+    try{ localStorage.removeItem('tb-unlocked'); }catch(e){}
+    setUnlocked(false);
+  }
 
   // Hooks must run unconditionally on every render (Rules of Hooks) — so
   // useMemo runs here, before any early return below, using a safe empty
@@ -415,6 +482,12 @@ function App(){
       h('p',{key:'p',style:{maxWidth:360}}, 'No se pudo conectar el panel en tiempo real desde esta vista. Ábrelo desde tu enlace en Claude, con tu sesión iniciada, para ver y editar los datos sincronizados.'),
     ]);
   }
+  if(data.accessCode === undefined){
+    return h('div',{className:'loadscreen'}, 'Cargando…');
+  }
+  if(!unlocked){
+    return h(Lock,{accessCode:data.accessCode, setTeamAccessCode:data.setTeamAccessCode, onUnlock:handleUnlock});
+  }
   if(data.athletes === null){
     return h('div',{className:'loadscreen'}, 'Cargando atletas…');
   }
@@ -433,7 +506,7 @@ function App(){
   data.events.forEach(ev=>{ eventsById[ev.id] = ev; });
 
   return h('div',{id:'app'},[
-    Sidebar({tab,setTab,synced:true}),
+    Sidebar({tab,setTab,onLock:handleLock}),
     h('main',{key:'main'},[
       tab==='dashboard' && Dashboard({active,activePresencial,activeOnline,totalMensual,promedio,collected,pendingAmt,pendingThisPeriod,period:data.period,flash:data.flash}),
       tab==='atletas' && Atletas({visibleAthletes,search,setSearch,filterMod,setFilterMod,filterEstado,setFilterEstado,setModal,setEstado:data.setEstado,flash:data.flash,eventsById}),
@@ -445,7 +518,7 @@ function App(){
   ]);
 }
 
-function Sidebar({tab,setTab}){
+function Sidebar({tab,setTab,onLock}){
   const items = [
     {key:'dashboard',label:'Dashboard',n:'01'},
     {key:'atletas',label:'Atletas',n:'02'},
@@ -467,6 +540,9 @@ function Sidebar({tab,setTab}){
       h('span',{className:'sync-dot',key:'d'}),
       'Sincronizado en tiempo real',
     ]),
+    h('button',{key:'lock',className:'sidebar-lock',onClick:onLock,style:{background:'none',border:'none',
+      color:'var(--sidebar-text-dim)',fontSize:11,textDecoration:'underline',
+      textAlign:'left',padding:'8px 22px 0',cursor:'pointer'}},'Bloquear panel'),
   ]);
 }
 
