@@ -354,6 +354,19 @@ function App(){
   const [filterMod,setFilterMod] = useState('Todos');
   const [filterEstado,setFilterEstado] = useState('Activo');
 
+  // Hooks must run unconditionally on every render (Rules of Hooks) — so
+  // useMemo runs here, before any early return below, using a safe empty
+  // list while the data is still loading.
+  const athletesList = data.athletes || [];
+  const visibleAthletes = useMemo(()=>{
+    return athletesList.filter(a=>{
+      if(filterMod!=='Todos' && a.modalidad!==filterMod) return false;
+      if(filterEstado!=='Todos' && a.estado!==filterEstado) return false;
+      if(search && !a.nombre.toLowerCase().includes(search.toLowerCase())) return false;
+      return true;
+    });
+  },[athletesList,filterMod,filterEstado,search]);
+
   if(data.db === undefined){
     return h('div',{className:'loadscreen'}, 'Conectando con tu equipo…');
   }
@@ -367,7 +380,7 @@ function App(){
     return h('div',{className:'loadscreen'}, 'Cargando atletas…');
   }
 
-  const athletes = data.athletes;
+  const athletes = athletesList;
   const active = athletes.filter(a=>a.estado==='Activo');
   const activePresencial = active.filter(a=>a.modalidad==='Presencial');
   const activeOnline = active.filter(a=>a.modalidad==='Online');
@@ -377,15 +390,6 @@ function App(){
   const pendingThisPeriod = active.filter(a=>!data.paidIds.has(a.id));
   const collected = paidThisPeriod.reduce((s,a)=>s+(Number(a.mensualidad)||0),0);
   const pendingAmt = pendingThisPeriod.reduce((s,a)=>s+(Number(a.mensualidad)||0),0);
-
-  const visibleAthletes = useMemo(()=>{
-    return athletes.filter(a=>{
-      if(filterMod!=='Todos' && a.modalidad!==filterMod) return false;
-      if(filterEstado!=='Todos' && a.estado!==filterEstado) return false;
-      if(search && !a.nombre.toLowerCase().includes(search.toLowerCase())) return false;
-      return true;
-    });
-  },[athletes,filterMod,filterEstado,search]);
 
   return h('div',{id:'app'},[
     Sidebar({tab,setTab,synced:true}),
@@ -635,5 +639,20 @@ function Modal({modal,setModal,upsertAthlete}){
 function Field(id,label,input){ return h('div',{className:'field',key:id},[h('label',{key:'l',htmlFor:id},label),input]); }
 function FieldRow(fields){ return h('div',{className:'field-row'},fields); }
 
-ReactDOM.createRoot(document.getElementById('app')).render(h(App));
+class ErrorBoundary extends React.Component{
+  constructor(props){ super(props); this.state = {error:null}; }
+  static getDerivedStateFromError(error){ return {error}; }
+  componentDidCatch(error,info){ console.error('Team Barrera crash:', error, info); }
+  render(){
+    if(this.state.error){
+      return h('div',{className:'loadscreen'},[
+        h('h2',{key:'h',style:{fontFamily:'Oswald',color:'var(--text)',margin:0}},'Algo salió mal'),
+        h('p',{key:'p',style:{maxWidth:360}},'El panel tuvo un error inesperado al cargar. Intenta recargar la página; si sigue pasando, avísale a quien lo construyó.'),
+      ]);
+    }
+    return this.props.children;
+  }
+}
+
+ReactDOM.createRoot(document.getElementById('app')).render(h(ErrorBoundary,null,h(App)));
 </script>
